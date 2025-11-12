@@ -1,91 +1,95 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from apscheduler.schedulers.background import BackgroundScheduler
-from .config import settings
-from .adapter import execute_once_and_persist
-from .storage import list_trades
 import time
+import os
+import json
+from apscheduler.schedulers.background import BackgroundScheduler
 
-try:
-    from kiteconnect import KiteConnect
-    KITE_LIB_AVAILABLE = True
-except Exception:
-    KITE_LIB_AVAILABLE = False
+# === Import your backtest logic modules ===
+# (If your code is inside app/strategy.py or app/core.py)
+# from app.strategy import run_backtest
+# from app.storage import log_trade, list_trades
 
-app = FastAPI(title="StockOrderBot API")
+app = FastAPI(title="📈 StockBot Backend", version="1.0.0")
 
-# Allow React dashboard
+# === CORS for frontend (React) ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # (change later for security)
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-scheduler = BackgroundScheduler()
-JOB_ID = "algo_job"
-STATE = {"running": False}
-
-class KiteExchangeIn(BaseModel):
-    api_key: str
-    api_secret: str
-    request_token: str
-
-class RunIn(BaseModel):
-    api_key: str = None
-    access_token: str = None
-    symbols: list = None
-    start_date: str = None
-    end_date: str = None
-
+# === Health Check ===
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.time()}
 
-@app.post("/kite/exchange")
-def kite_exchange(body: KiteExchangeIn):
-    if not KITE_LIB_AVAILABLE:
-        raise HTTPException(500, "kiteconnect not available")
-    try:
-        kite = KiteConnect(api_key=body.api_key)
-        session = kite.generate_session(body.request_token, api_secret=body.api_secret)
-        return {"access_token": session.get("access_token"), "user": session.get("user_id")}
-    except Exception as e:
-        raise HTTPException(400, str(e))
+# === Root Route ===
+@app.get("/")
+def root():
+    return {
+        "message": "✅ StockBot backend is live and ready!",
+        "docs": "Visit /docs for API documentation.",
+        "repo": "https://github.com/YOUR_GITHUB_USERNAME/stockbot-backend"
+    }
 
+# === Example model for POST requests ===
+class RunRequest(BaseModel):
+    api_key: str
+    access_token: str
+    start_date: str = "2024-01-01"
+    end_date: str = "2025-01-01"
+
+# === Placeholder backtest function ===
+def mock_backtest(api_key, access_token, start_date, end_date):
+    # Simulate running your algorithm
+    time.sleep(2)
+    return {
+        "api_key_used": api_key[-4:],  # just show partial key for confirmation
+        "start_date": start_date,
+        "end_date": end_date,
+        "summary": {
+            "Total PnL": 134000,
+            "Win Rate %": 57.2,
+            "Trades": 82,
+            "Expectancy": 420.7
+        }
+    }
+
+# === Manual trigger endpoint ===
 @app.post("/run_once")
-def run_once(body: RunIn = Body(...)):
-    kite_creds = None
-    if body.api_key and body.access_token:
-        kite_creds = {"api_key": body.api_key, "access_token": body.access_token}
-    result = execute_once_and_persist(symbols=body.symbols, start_date=body.start_date, end_date=body.end_date, kite_creds=kite_creds)
-    return {"summary": result.get("summary"), "final_equity_avg": result.get("final_equity_avg"), "trades_count": len(result.get("trades", []))}
+def run_once(data: RunRequest, background_tasks: BackgroundTasks):
+    try:
+        # You can later replace mock_backtest() with your real backtest
+        background_tasks.add_task(mock_backtest, data.api_key, data.access_token, data.start_date, data.end_date)
+        return {"status": "started", "message": "Backtest launched in background."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/start")
-def start(interval_seconds: int = settings.POLL_INTERVAL_SECONDS):
-    if STATE["running"]:
-        return {"status": "already running"}
-    scheduler.add_job(lambda: execute_once_and_persist(), "interval", seconds=interval_seconds, id=JOB_ID)
-    scheduler.start()
-    STATE["running"] = True
-    return {"status": "started", "interval_seconds": interval_seconds}
-
-@app.post("/stop")
-def stop():
-    if not STATE["running"]:
-        return {"status": "not running"}
-    scheduler.remove_job(JOB_ID)
-    STATE["running"] = False
-    return {"status": "stopped"}
-
-@app.get("/status")
-def status():
-    return {"running": STATE["running"]}
-
+# === Check trade logs (placeholder) ===
 @app.get("/trades")
-def trades(limit: int = 100):
-    data = list_trades(limit)
-    for rec in data:
-        rec["_id"] = str(rec["_id"])
-    return {"count": len(data), "trades": data}
+def get_trades():
+    # Replace this with MongoDB call if connected
+    mock_data = [
+        {"symbol": "RELIANCE", "PnL": 1200, "action": "BUY", "date": "2024-06-12"},
+        {"symbol": "TCS", "PnL": -300, "action": "SELL", "date": "2024-06-13"},
+    ]
+    return {"trades": mock_data, "count": len(mock_data)}
+
+# === Background scheduler (optional for auto-run) ===
+scheduler = BackgroundScheduler()
+
+def scheduled_task():
+    print("📊 Scheduled backtest triggered at", time.ctime())
+
+scheduler.add_job(scheduled_task, "interval", hours=24)
+scheduler.start()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown(wait=False)
+    print("🛑 Scheduler stopped cleanly.")
+
