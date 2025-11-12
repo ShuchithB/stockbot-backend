@@ -5,6 +5,6 @@ apscheduler==3.10.4
 python-dotenv==1.0.1
 pandas==2.2.3
 numpy==1.26.4
-kiteconnect==3.13.0
+kiteconnect==3.12.0
 pydantic==1.10.13
 requests==2.31.0
