@@ -9,41 +9,46 @@ import pymongo
 import time, os, datetime
 from kiteconnect import KiteConnect
 
-# === FastAPI App ===
-app = FastAPI(title="📈 StockBot Backend", version="3.0.0")
+app = FastAPI(title="📈 StockBot Backend", version="3.5.0")
 
-# === CORS for frontend ===
+# === Middleware ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can later restrict this to your frontend domain
+    allow_origins=["*"],  # Update later for security
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === Environment Config ===
+# === Environment Variables ===
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "stockbot")
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET")
-KITE_REDIRECT_URL = os.getenv("KITE_REDIRECT_URL")  # e.g. https://stockbot-backend.onrender.com/kite/callback
+KITE_REDIRECT_URL = os.getenv("KITE_REDIRECT_URL")  # Must match Zerodha developer app
 
-# === Mongo Helper ===
+# === Mongo Helpers ===
+def save_access_token(access_token):
+    client = pymongo.MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    db["config"].update_one(
+        {"name": "kite_access_token"},
+        {"$set": {"access_token": access_token, "updated_at": datetime.datetime.utcnow()}},
+        upsert=True
+    )
+    print("✅ Token saved to MongoDB.")
+
+
 def get_latest_access_token():
-    """Fetch latest Kite Access Token from MongoDB."""
     try:
         client = pymongo.MongoClient(MONGO_URI)
         db = client[DB_NAME]
         cfg = db["config"].find_one({"name": "kite_access_token"})
         if cfg and "access_token" in cfg:
-            print("✅ Access Token loaded from MongoDB.")
             return cfg["access_token"]
-        else:
-            print("⚠️ No access token found in MongoDB.")
-            return None
     except Exception as e:
-        print("❌ MongoDB error:", e)
-        return None
+        print("❌ Mongo Error:", e)
+    return None
 
 
 # === Strategy Parameters ===
@@ -54,14 +59,15 @@ RISK_PER_TRADE, TRANSACTION_COST, SLIPPAGE = 0.0075, 0.0015, 0.0005
 INITIAL_CAPITAL = 1_000_000
 
 
-# === Indicators & Backtest Logic ===
 def compute_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_mid"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
     delta = df["close"].diff()
-    up, down = np.where(delta > 0, delta, 0), np.where(delta < 0, -delta, 0)
-    roll_up, roll_down = pd.Series(up).rolling(RSI_PERIOD).mean(), pd.Series(down).rolling(RSI_PERIOD).mean()
+    up = np.where(delta > 0, delta, 0)
+    down = np.where(delta < 0, -delta, 0)
+    roll_up = pd.Series(up).rolling(RSI_PERIOD).mean()
+    roll_down = pd.Series(down).rolling(RSI_PERIOD).mean()
     rs = roll_up / roll_down
     df["rsi"] = 100 - (100 / (1 + rs))
     high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
@@ -74,7 +80,6 @@ def backtest_symbol(df, symbol):
     df = compute_indicators(df)
     equity, position, entry_price, trail_stop = INITIAL_CAPITAL, 0, 0, None
     trades = []
-
     for i in range(1, len(df)):
         row = df.iloc[i]
         if np.isnan(row["atr"]) or row["atr"] == 0:
@@ -86,7 +91,6 @@ def backtest_symbol(df, symbol):
         in_uptrend = row["ema_mid"] > row["ema_slow"]
         entry_cond = in_uptrend and rsi > 60 and price > row["ema_fast"]
         exit_cond = (rsi < 45 or price < row["ema_fast"])
-
         if position == 0 and entry_cond:
             risk_amt = equity * RISK_PER_TRADE
             stop_dist = row["atr"] * ATR_MULT
@@ -95,7 +99,6 @@ def backtest_symbol(df, symbol):
             trail_stop = entry_price - ATR_MULT * row["atr"]
             position = qty
             trades.append({"Symbol": symbol, "Date": row["date"], "Action": "BUY", "Qty": qty, "Price": entry_price})
-
         elif position > 0:
             new_trail = price - ATR_MULT * row["atr"]
             if new_trail > trail_stop:
@@ -111,7 +114,6 @@ def backtest_symbol(df, symbol):
                     "Qty": position, "Price": exit_price, "PnL": net_pnl
                 })
                 position, trail_stop = 0, None
-
     return pd.DataFrame(trades), equity
 
 
@@ -133,95 +135,53 @@ def summarize_backtest(trades_df):
     }
 
 
-# === Backtest Trigger ===
-class RunRequest(BaseModel):
-    api_key: str = None
-    access_token: str = None
-    start_date: str = "2024-01-01"
-    end_date: str = "2025-01-01"
-
-
-def run_backtest(api_key, access_token, start_date, end_date):
+def run_backtest(api_key, access_token):
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
     try:
         data = kite.historical_data(
             instrument_token=kite.ltp("NSE:RELIANCE")["NSE:RELIANCE"]["instrument_token"],
-            from_date=start_date, to_date=end_date, interval="day"
+            from_date="2024-01-01", to_date="2025-01-01", interval="day"
         )
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
-        trades, equity = backtest_symbol(df, "RELIANCE")
+        trades, _ = backtest_symbol(df, "RELIANCE")
         summary = summarize_backtest(trades)
-        print("✅ Backtest Completed:", summary)
+        print("✅ Backtest completed:", summary)
         return summary
     except Exception as e:
-        print("❌ Error during backtest:", e)
+        print("❌ Error running backtest:", e)
         raise
 
 
-# === Manual Backtest Endpoint ===
-@app.post("/run_once")
-def run_once(data: RunRequest, background_tasks: BackgroundTasks):
-    try:
-        token = data.access_token or get_latest_access_token()
-        if not token:
-            raise HTTPException(status_code=400, detail="No valid Kite Access Token found. Please generate it first.")
-
-        background_tasks.add_task(run_backtest, data.api_key or KITE_API_KEY, token, data.start_date, data.end_date)
-        return {"status": "started", "message": "Backtest running in background."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# === Kite Access Token Manual Generation ===
 @app.get("/generate_token_url")
 def generate_token_url():
-    """Return Zerodha login URL for user-triggered token generation."""
     try:
         kite = KiteConnect(api_key=KITE_API_KEY)
-        login_url = kite.login_url()
-        print("🔗 Kite login URL generated.")
-        return {"login_url": login_url}
+        return {"login_url": kite.login_url()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate login URL: {e}")
+        raise HTTPException(status_code=500, detail=f"Kite API Error: {e}")
 
 
 @app.get("/kite/callback")
 def kite_callback(request_token: str):
-    """Kite redirect handler."""
     try:
         kite = KiteConnect(api_key=KITE_API_KEY)
         data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
         access_token = data["access_token"]
+        save_access_token(access_token)
 
-        client = pymongo.MongoClient(MONGO_URI)
-        db = client[DB_NAME]
-        db["config"].update_one(
-            {"name": "kite_access_token"},
-            {"$set": {"access_token": access_token, "updated_at": datetime.datetime.utcnow()}},
-            upsert=True
-        )
+        # Run backtest automatically
+        summary = run_backtest(KITE_API_KEY, access_token)
 
-        print("✅ Access Token saved to MongoDB.")
-        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?token_success=true")
+        # Redirect to frontend with encoded summary
+        summary_params = "&".join([f"{k}={v}" for k, v in summary.items()])
+        return RedirectResponse(url=f"https://stockbot-dashboard.onrender.com?login_success=true&{summary_params}")
     except Exception as e:
-        print("❌ Token generation failed:", e)
-        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?token_error=true")
+        print("❌ Callback error:", e)
+        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?login_error=true")
 
 
-# === Health Check ===
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.time()}
-
-
-# === Scheduler ===
-scheduler = BackgroundScheduler()
-scheduler.add_job(lambda: print("📊 Daily check:", datetime.datetime.now()), "interval", hours=24)
-scheduler.start()
-
-@app.on_event("shutdown")
-def shutdown_event():
-    scheduler.shutdown(wait=False)
-    print("🛑 Scheduler stopped cleanly.")
