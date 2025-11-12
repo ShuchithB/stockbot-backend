@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import pandas as pd
@@ -9,23 +10,27 @@ import time, os, datetime
 from kiteconnect import KiteConnect
 
 # === FastAPI App ===
-app = FastAPI(title="📈 StockBot Backend", version="2.0.0")
+app = FastAPI(title="📈 StockBot Backend", version="3.0.0")
 
-# === CORS (Frontend Access) ===
+# === CORS for frontend ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change later for security
+    allow_origins=["*"],  # You can later restrict this to your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === MongoDB Config ===
+# === Environment Config ===
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "stockbot")
+KITE_API_KEY = os.getenv("KITE_API_KEY")
+KITE_API_SECRET = os.getenv("KITE_API_SECRET")
+KITE_REDIRECT_URL = os.getenv("KITE_REDIRECT_URL")  # e.g. https://stockbot-backend.onrender.com/kite/callback
 
+# === Mongo Helper ===
 def get_latest_access_token():
-    """Fetch the latest Kite access token stored in MongoDB."""
+    """Fetch latest Kite Access Token from MongoDB."""
     try:
         client = pymongo.MongoClient(MONGO_URI)
         db = client[DB_NAME]
@@ -37,7 +42,7 @@ def get_latest_access_token():
             print("⚠️ No access token found in MongoDB.")
             return None
     except Exception as e:
-        print("❌ Error fetching token:", e)
+        print("❌ MongoDB error:", e)
         return None
 
 
@@ -49,7 +54,7 @@ RISK_PER_TRADE, TRANSACTION_COST, SLIPPAGE = 0.0075, 0.0015, 0.0005
 INITIAL_CAPITAL = 1_000_000
 
 
-# === Utility Functions ===
+# === Indicators & Backtest Logic ===
 def compute_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_mid"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
@@ -69,6 +74,7 @@ def backtest_symbol(df, symbol):
     df = compute_indicators(df)
     equity, position, entry_price, trail_stop = INITIAL_CAPITAL, 0, 0, None
     trades = []
+
     for i in range(1, len(df)):
         row = df.iloc[i]
         if np.isnan(row["atr"]) or row["atr"] == 0:
@@ -81,7 +87,6 @@ def backtest_symbol(df, symbol):
         entry_cond = in_uptrend and rsi > 60 and price > row["ema_fast"]
         exit_cond = (rsi < 45 or price < row["ema_fast"])
 
-        # Entry
         if position == 0 and entry_cond:
             risk_amt = equity * RISK_PER_TRADE
             stop_dist = row["atr"] * ATR_MULT
@@ -91,7 +96,6 @@ def backtest_symbol(df, symbol):
             position = qty
             trades.append({"Symbol": symbol, "Date": row["date"], "Action": "BUY", "Qty": qty, "Price": entry_price})
 
-        # Manage position
         elif position > 0:
             new_trail = price - ATR_MULT * row["atr"]
             if new_trail > trail_stop:
@@ -107,6 +111,7 @@ def backtest_symbol(df, symbol):
                     "Qty": position, "Price": exit_price, "PnL": net_pnl
                 })
                 position, trail_stop = 0, None
+
     return pd.DataFrame(trades), equity
 
 
@@ -123,14 +128,12 @@ def summarize_backtest(trades_df):
         "Total PnL": round(total_pnl, 2),
         "Win Rate %": round(win_rate, 2),
         "Trades": len(trades_df),
-        "Avg Win": round(avg_win, 2),
-        "Avg Loss": round(avg_loss, 2),
         "Reward:Risk": round(rr, 2) if not np.isnan(rr) else None,
         "Expectancy": round(expectancy, 2)
     }
 
 
-# === FastAPI Models ===
+# === Backtest Trigger ===
 class RunRequest(BaseModel):
     api_key: str = None
     access_token: str = None
@@ -138,58 +141,84 @@ class RunRequest(BaseModel):
     end_date: str = "2025-01-01"
 
 
-# === Backtest Executor ===
 def run_backtest(api_key, access_token, start_date, end_date):
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
-    print(f"📡 Fetching NIFTY100 symbols data from {start_date} → {end_date}")
-
     try:
-        df = kite.historical_data(
+        data = kite.historical_data(
             instrument_token=kite.ltp("NSE:RELIANCE")["NSE:RELIANCE"]["instrument_token"],
-            from_date=start_date,
-            to_date=end_date,
-            interval="day"
+            from_date=start_date, to_date=end_date, interval="day"
         )
-        df = pd.DataFrame(df)
+        df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
         trades, equity = backtest_symbol(df, "RELIANCE")
         summary = summarize_backtest(trades)
         print("✅ Backtest Completed:", summary)
         return summary
     except Exception as e:
-        print("❌ Backtest Error:", e)
+        print("❌ Error during backtest:", e)
         raise
 
 
-# === API Endpoints ===
-@app.get("/")
-def home():
-    return {"message": "✅ StockBot backend live!", "version": "2.0.0"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": time.time()}
-
+# === Manual Backtest Endpoint ===
 @app.post("/run_once")
 def run_once(data: RunRequest, background_tasks: BackgroundTasks):
     try:
         token = data.access_token or get_latest_access_token()
         if not token:
-            raise HTTPException(status_code=400, detail="No valid Kite Access Token found. Please refresh it.")
+            raise HTTPException(status_code=400, detail="No valid Kite Access Token found. Please generate it first.")
 
-        background_tasks.add_task(run_backtest, data.api_key or os.getenv("KITE_API_KEY"), token, data.start_date, data.end_date)
-        return {"status": "started", "message": "Backtest running in background.", "auto_token": not bool(data.access_token)}
+        background_tasks.add_task(run_backtest, data.api_key or KITE_API_KEY, token, data.start_date, data.end_date)
+        return {"status": "started", "message": "Backtest running in background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# === Background Scheduler (Optional) ===
-scheduler = BackgroundScheduler()
-def scheduled_task():
-    print("📊 Daily Auto Backtest Triggered:", datetime.datetime.now())
+# === Kite Access Token Manual Generation ===
+@app.get("/generate_token_url")
+def generate_token_url():
+    """Return Zerodha login URL for user-triggered token generation."""
+    try:
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        login_url = kite.login_url()
+        print("🔗 Kite login URL generated.")
+        return {"login_url": login_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate login URL: {e}")
 
-scheduler.add_job(scheduled_task, "interval", hours=24)
+
+@app.get("/kite/callback")
+def kite_callback(request_token: str):
+    """Kite redirect handler."""
+    try:
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
+        access_token = data["access_token"]
+
+        client = pymongo.MongoClient(MONGO_URI)
+        db = client[DB_NAME]
+        db["config"].update_one(
+            {"name": "kite_access_token"},
+            {"$set": {"access_token": access_token, "updated_at": datetime.datetime.utcnow()}},
+            upsert=True
+        )
+
+        print("✅ Access Token saved to MongoDB.")
+        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?token_success=true")
+    except Exception as e:
+        print("❌ Token generation failed:", e)
+        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?token_error=true")
+
+
+# === Health Check ===
+@app.get("/health")
+def health():
+    return {"status": "ok", "time": time.time()}
+
+
+# === Scheduler ===
+scheduler = BackgroundScheduler()
+scheduler.add_job(lambda: print("📊 Daily check:", datetime.datetime.now()), "interval", hours=24)
 scheduler.start()
 
 @app.on_event("shutdown")
