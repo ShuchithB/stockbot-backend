@@ -9,49 +9,30 @@ import pymongo
 import time, os, datetime
 from kiteconnect import KiteConnect
 
-app = FastAPI(title="📈 StockBot Backend", version="3.5.0")
+app = FastAPI(title="📈 StockBot Backend", version="4.0.0")
 
 # === Middleware ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update later for security
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === Environment Variables ===
+# === Environment Vars ===
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "stockbot")
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET")
-KITE_REDIRECT_URL = os.getenv("KITE_REDIRECT_URL")  # Must match Zerodha developer app
+KITE_REDIRECT_URL = os.getenv("KITE_REDIRECT_URL")
 
-# === Mongo Helpers ===
-def save_access_token(access_token):
+# === Mongo Helper ===
+def get_db():
     client = pymongo.MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    db["config"].update_one(
-        {"name": "kite_access_token"},
-        {"$set": {"access_token": access_token, "updated_at": datetime.datetime.utcnow()}},
-        upsert=True
-    )
-    print("✅ Token saved to MongoDB.")
+    return client[DB_NAME]
 
-
-def get_latest_access_token():
-    try:
-        client = pymongo.MongoClient(MONGO_URI)
-        db = client[DB_NAME]
-        cfg = db["config"].find_one({"name": "kite_access_token"})
-        if cfg and "access_token" in cfg:
-            return cfg["access_token"]
-    except Exception as e:
-        print("❌ Mongo Error:", e)
-    return None
-
-
-# === Strategy Parameters ===
+# === Strategy Config ===
 EMA_FAST, EMA_MID, EMA_SLOW = 20, 50, 100
 RSI_PERIOD, ATR_PERIOD = 14, 14
 ATR_MULT, MIN_ATR_PCT = 2.5, 0.012
@@ -59,6 +40,7 @@ RISK_PER_TRADE, TRANSACTION_COST, SLIPPAGE = 0.0075, 0.0015, 0.0005
 INITIAL_CAPITAL = 1_000_000
 
 
+# === Core Backtest ===
 def compute_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_mid"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
@@ -78,19 +60,24 @@ def compute_indicators(df):
 
 def backtest_symbol(df, symbol):
     df = compute_indicators(df)
-    equity, position, entry_price, trail_stop = INITIAL_CAPITAL, 0, 0, None
-    trades = []
+    equity = INITIAL_CAPITAL
+    position, entry_price, trail_stop = 0, 0, None
+    trades, equity_curve = [], []
+
     for i in range(1, len(df)):
         row = df.iloc[i]
         if np.isnan(row["atr"]) or row["atr"] == 0:
             continue
+
         atr_ratio = row["atr"] / row["close"]
         if atr_ratio < MIN_ATR_PCT:
             continue
+
         price, rsi = row["close"], row["rsi"]
         in_uptrend = row["ema_mid"] > row["ema_slow"]
         entry_cond = in_uptrend and rsi > 60 and price > row["ema_fast"]
         exit_cond = (rsi < 45 or price < row["ema_fast"])
+
         if position == 0 and entry_cond:
             risk_amt = equity * RISK_PER_TRADE
             stop_dist = row["atr"] * ATR_MULT
@@ -99,10 +86,12 @@ def backtest_symbol(df, symbol):
             trail_stop = entry_price - ATR_MULT * row["atr"]
             position = qty
             trades.append({"Symbol": symbol, "Date": row["date"], "Action": "BUY", "Qty": qty, "Price": entry_price})
+
         elif position > 0:
             new_trail = price - ATR_MULT * row["atr"]
             if new_trail > trail_stop:
                 trail_stop = new_trail
+
             if exit_cond or price < trail_stop:
                 exit_price = price * (1 - SLIPPAGE)
                 pnl = (exit_price - entry_price) * position
@@ -110,20 +99,30 @@ def backtest_symbol(df, symbol):
                 net_pnl = pnl - cost
                 equity += net_pnl
                 trades.append({
-                    "Symbol": symbol, "Date": row["date"], "Action": "SELL",
-                    "Qty": position, "Price": exit_price, "PnL": net_pnl
+                    "Symbol": symbol,
+                    "Date": row["date"],
+                    "Action": "SELL",
+                    "Qty": position,
+                    "Price": exit_price,
+                    "PnL": net_pnl
                 })
                 position, trail_stop = 0, None
-    return pd.DataFrame(trades), equity
+
+        equity_curve.append({"date": str(row["date"].date()), "equity": round(equity, 2)})
+
+    return pd.DataFrame(trades), pd.DataFrame(equity_curve), equity
 
 
 def summarize_backtest(trades_df):
     if trades_df.empty:
-        return {"TotalPnL": 0, "WinRate": 0, "Trades": 0}
+        return {"Total PnL": 0, "Win Rate %": 0, "Trades": 0}
     trades_df["PnL"] = trades_df["PnL"].fillna(0)
-    wins, losses = trades_df[trades_df["PnL"] > 0]["PnL"], trades_df[trades_df["PnL"] < 0]["PnL"]
-    total_pnl, win_rate = trades_df["PnL"].sum(), (len(wins) / len(trades_df)) * 100
-    avg_win, avg_loss = wins.mean() if len(wins) else 0, losses.mean() if len(losses) else 0
+    wins = trades_df[trades_df["PnL"] > 0]["PnL"]
+    losses = trades_df[trades_df["PnL"] < 0]["PnL"]
+    total_pnl = trades_df["PnL"].sum()
+    win_rate = (len(wins) / len(trades_df)) * 100
+    avg_win = wins.mean() if len(wins) > 0 else 0
+    avg_loss = losses.mean() if len(losses) > 0 else 0
     rr = abs(avg_win / avg_loss) if avg_loss != 0 else np.nan
     expectancy = (win_rate / 100) * avg_win + (1 - (win_rate / 100)) * avg_loss
     return {
@@ -131,10 +130,11 @@ def summarize_backtest(trades_df):
         "Win Rate %": round(win_rate, 2),
         "Trades": len(trades_df),
         "Reward:Risk": round(rr, 2) if not np.isnan(rr) else None,
-        "Expectancy": round(expectancy, 2)
+        "Expectancy": round(expectancy, 2),
     }
 
 
+# === Run + Save to Mongo ===
 def run_backtest(api_key, access_token):
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
@@ -145,22 +145,28 @@ def run_backtest(api_key, access_token):
         )
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
-        trades, _ = backtest_symbol(df, "RELIANCE")
+        trades, equity_curve, _ = backtest_symbol(df, "RELIANCE")
         summary = summarize_backtest(trades)
-        print("✅ Backtest completed:", summary)
+
+        db = get_db()
+        db["backtests"].insert_one({
+            "timestamp": datetime.datetime.utcnow(),
+            "symbol": "RELIANCE",
+            "summary": summary,
+            "equity_curve": equity_curve.to_dict("records"),
+            "trades": trades.to_dict("records")
+        })
         return summary
     except Exception as e:
         print("❌ Error running backtest:", e)
         raise
 
 
+# === Routes ===
 @app.get("/generate_token_url")
 def generate_token_url():
-    try:
-        kite = KiteConnect(api_key=KITE_API_KEY)
-        return {"login_url": kite.login_url()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Kite API Error: {e}")
+    kite = KiteConnect(api_key=KITE_API_KEY)
+    return {"login_url": kite.login_url()}
 
 
 @app.get("/kite/callback")
@@ -169,17 +175,20 @@ def kite_callback(request_token: str):
         kite = KiteConnect(api_key=KITE_API_KEY)
         data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
         access_token = data["access_token"]
-        save_access_token(access_token)
 
-        # Run backtest automatically
         summary = run_backtest(KITE_API_KEY, access_token)
-
-        # Redirect to frontend with encoded summary
-        summary_params = "&".join([f"{k}={v}" for k, v in summary.items()])
-        return RedirectResponse(url=f"https://stockbot-dashboard.onrender.com?login_success=true&{summary_params}")
+        params = "&".join([f"{k}={v}" for k, v in summary.items()])
+        return RedirectResponse(f"https://stockbot-dashboard.onrender.com?login_success=true&{params}")
     except Exception as e:
-        print("❌ Callback error:", e)
-        return RedirectResponse(url="https://stockbot-dashboard.onrender.com?login_error=true")
+        return RedirectResponse("https://stockbot-dashboard.onrender.com?login_error=true")
+
+
+# === 🔹 New route: fetch history ===
+@app.get("/backtests")
+def get_all_backtests():
+    db = get_db()
+    records = list(db["backtests"].find({}, {"_id": 0}))
+    return {"backtests": records}
 
 
 @app.get("/health")
