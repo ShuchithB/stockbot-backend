@@ -10,6 +10,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
+from app.fast_swing_strategy import run_fast_swing_backtest
+
 
 import pymongo
 from pymongo import MongoClient
@@ -182,6 +184,7 @@ def is_token_valid():
 STRATEGIES = {
     "swing": run_swing_backtest,
     "momentum": run_momentum_backtest
+    "fast_swing": run_fast_swing_backtest
 }
 
 
@@ -295,3 +298,4 @@ def get_backtests():
     except Exception as e:
         print("❌ ERROR /backtests:", e)
         return JSONResponse({"detail": str(e)}, 500)
+
