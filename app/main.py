@@ -13,6 +13,13 @@ from pydantic import BaseModel
 
 import pymongo
 from kiteconnect import KiteConnect
+from pymongo import MongoClient
+
+
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client["stockbot"]
+
 
 # Import your strategy implementations
 from app.swing_strategy import run_backtest as run_swing_backtest
@@ -272,3 +279,4 @@ def list_backtests(limit: int = 50):
         return {"backtests": docs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
