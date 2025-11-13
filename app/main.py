@@ -371,6 +371,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # -------------------------------------------------------------------
 
 print("🚀 StockBot Backend Loaded Successfully")
-print("📌 Mongo Status:", "Connected" if mongo_db else "Not connected")
+print("🟢 Mongo Status:", "Connected to DB" if mongo_db is not None else "DB is None")
 print("📌 Env -> API_KEY:", bool(KITE_API_KEY), " | SECRET:", bool(KITE_API_SECRET))
 print("📌 Token Exists:", bool(get_latest_access_token()))
+
