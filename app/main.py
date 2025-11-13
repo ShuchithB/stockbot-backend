@@ -184,7 +184,7 @@ def is_token_valid():
 STRATEGIES = {
     "swing": run_swing_backtest,
     "momentum": run_momentum_backtest,
-    "fast_swing": run_fast_swing_backtest
+    "fast_swing": run_fast_swing_backtest,
 }
 
 
@@ -195,7 +195,7 @@ class StrategyRequest(BaseModel):
     strategy: str = "swing"
     start_date: str
     end_date: str
-    symbols_file: str = "nifty100.csv"
+    symbols_file: str | None = "nifty100.csv"
 
 
 # -----------------------------------------
@@ -259,7 +259,7 @@ def run_strategy(req: StrategyRequest, bg: BackgroundTasks):
                 ACCESS_TOKEN=access_token,
                 START_DATE=req.start_date,
                 END_DATE=req.end_date,
-                NIFTY100_FILE=req.symbols_file
+                NIFTY100_FILE=req.symbols_file or "nifty100.csv"
             )
 
             record = {
@@ -298,5 +298,6 @@ def get_backtests():
     except Exception as e:
         print("❌ ERROR /backtests:", e)
         return JSONResponse({"detail": str(e)}, 500)
+
 
 
