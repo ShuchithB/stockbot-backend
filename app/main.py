@@ -4,25 +4,19 @@ import json
 import time
 import datetime
 from typing import Optional
-import math
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
-from app.fast_swing_strategy import run_fast_swing_backtest
 
-
-import pymongo
+import pandas as pd
 from pymongo import MongoClient
 from kiteconnect import KiteConnect
 
-from bson.decimal128 import Decimal128
-from bson.objectid import ObjectId
-
-# -------------------------------
-# Load environment variables
-# -------------------------------
+# ==============================
+# ENV / DB INIT
+# ==============================
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "stockbot")
 
@@ -36,89 +30,120 @@ if not MONGO_URI:
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client[DB_NAME]
 
-# Strategy imports
+
+# ==============================
+# Import strategies
+# ==============================
 from app.swing_strategy import run_backtest as run_swing_backtest
+from app.fast_swing_strategy import run_fast_swing_backtest
 
-# Lightweight momentum strategy for quick tests
-def run_momentum_backtest(API_KEY, ACCESS_TOKEN, START_DATE, END_DATE, NIFTY100_FILE):
+
+# ==============================
+# Helper to save & load token
+# ==============================
+def save_access_token(access_token: str, expiry_minutes: int = 9):
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=expiry_minutes)
+    mongo_db["config"].update_one(
+        {"name": "kite_access_token"},
+        {"$set": {"access_token": access_token, "expiry": expiry.isoformat()}},
+        upsert=True
+    )
+    print("✅ Saved access token until:", expiry)
+
+
+def get_saved_token():
+    cfg = mongo_db["config"].find_one({"name": "kite_access_token"})
+    if not cfg:
+        return None
+    return cfg.get("access_token")
+
+
+def is_token_valid():
     try:
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(ACCESS_TOKEN)
+        cfg = mongo_db["config"].find_one({"name": "kite_access_token"})
+        if not cfg:
+            return False
+        expiry = cfg.get("expiry")
+        if not expiry:
+            return False
+        expiry = datetime.datetime.fromisoformat(expiry)
+        return expiry > datetime.datetime.utcnow()
+    except:
+        return False
 
-        inst = kite.ltp("NSE:RELIANCE")
-        token = list(inst.values())[0]["instrument_token"]
 
-        raw = kite.historical_data(token, START_DATE, END_DATE, "day")
+# ==============================
+# Historical Data Fetch (Kite)
+# ==============================
+def fetch_historical_kite(symbol: str, start: str, end: str, interval="day"):
+    """Fetch candles for each symbol safely."""
+    try:
+        token = get_saved_token()
+        if not token:
+            print("⚠ No access token")
+            return []
 
-        import pandas as pd
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        kite.set_access_token(token)
+
+        # Resolve instrument token
+        ltp = kite.ltp(f"NSE:{symbol}")
+        if not ltp:
+            return []
+        inst_token = list(ltp.values())[0]["instrument_token"]
+
+        raw = kite.historical_data(inst_token, start, end, interval)
+
+        if not raw:
+            return []
+
         df = pd.DataFrame(raw)
         df["date"] = pd.to_datetime(df["date"])
-        df["ema20"] = df["close"].ewm(20).mean()
-        df["ema50"] = df["close"].ewm(50).mean()
-
-        trades = []
-        equity = 1_000_000
-        entry = None
-        eq = []
-
-        for i in range(len(df)):
-            price = df["close"].iloc[i]
-            eq.append({"date": str(df["date"].iloc[i].date()), "portfolio_equity": equity})
-
-            if i < 50:
-                continue
-
-            if entry is None and df["ema20"].iloc[i] > df["ema50"].iloc[i]:
-                entry = price
-                trades.append({"Symbol":"RELIANCE","Date":str(df["date"].iloc[i]),"Action":"BUY","Price":price,"Qty":1})
-            elif entry is not None and df["ema20"].iloc[i] < df["ema50"].iloc[i]:
-                pnl = price - entry
-                equity += pnl
-                trades.append({"Symbol":"RELIANCE","Date":str(df["date"].iloc[i]),"Action":"SELL","Price":price,"Qty":1,"PnL":pnl})
-                entry = None
-
-        return {"trades": trades, "equity": eq}
+        return df
 
     except Exception as e:
-        print("Momentum error:", e)
-        return {"trades": [], "equity": []}
+        print("❌ fetch_historical_kite:", e)
+        return []
 
 
-# -----------------------------------------
-# Sanitizer for JSON safety
-# -----------------------------------------
-def sanitize(obj):
-    """Recursively fix invalid JSON values (NaN, inf, datetime, ObjectId, Decimal128)."""
-    if obj is None:
-        return None
-
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-
-    if isinstance(obj, Decimal128):
-        return float(obj.to_decimal())
-
-    if isinstance(obj, (datetime.datetime, datetime.date)):
-        return obj.isoformat()
-
-    if isinstance(obj, ObjectId):
-        return str(obj)
-
-    if isinstance(obj, list):
-        return [sanitize(v) for v in obj]
-
-    if isinstance(obj, dict):
-        return {k: sanitize(v) for k, v in obj.items()}
-
-    return obj
+# ==============================
+# Wrapper for FAST SWING Strategy
+# ==============================
+def run_fast_swing_wrapper(API_KEY, ACCESS_TOKEN, START_DATE, END_DATE, NIFTY100_FILE):
+    return run_fast_swing_backtest(
+        API_KEY=API_KEY,
+        ACCESS_TOKEN=ACCESS_TOKEN,
+        START_DATE=START_DATE,
+        END_DATE=END_DATE,
+        NIFTY100_FILE=NIFTY100_FILE,
+        fetch_historical=lambda sym, start, end, interval="day": fetch_historical_kite(sym, start, end, interval)
+    )
 
 
-# -----------------------------------------
-# FastAPI App with CORS
-# -----------------------------------------
-app = FastAPI(title="StockBot Backend", version="2.0.0")
+# ==============================
+# Strategy registry
+# ==============================
+STRATEGIES = {
+    "swing": run_swing_backtest,
+    "momentum": lambda *a, **k: {"trades": [], "equity": []},   # minimal placeholder
+    "fast_swing": run_fast_swing_wrapper,
+}
+
+
+# ==============================
+# API Models
+# ==============================
+class StrategyRequest(BaseModel):
+    strategy: str
+    start_date: str
+    end_date: str
+    symbols_file: str = "nifty100.csv"
+
+
+# ==============================
+# FASTAPI SETUP
+# ==============================
+app = FastAPI(title="StockBot Backend", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,91 +154,26 @@ app.add_middleware(
 )
 
 
-# -----------------------------------------
-# MongoDB Helpers
-# -----------------------------------------
-def save_access_token(access_token: str, expiry_minutes: int = 9):
-    try:
-        expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=expiry_minutes)
-        mongo_db["config"].update_one(
-            {"name": "kite_access_token"},
-            {"$set": {"access_token": access_token, "expiry": expiry.isoformat()}},
-            upsert=True
-        )
-        print("✅ Saved access token with expiry:", expiry)
-    except Exception as e:
-        print("❌ Failed saving token:", e)
-
-
-def get_saved_token():
-    try:
-        cfg = mongo_db["config"].find_one({"name": "kite_access_token"})
-        if not cfg:
-            return None
-        return cfg.get("access_token")
-    except:
-        return None
-
-
-def is_token_valid():
-    try:
-        cfg = mongo_db["config"].find_one({"name": "kite_access_token"})
-        if not cfg:
-            return False
-
-        expiry = cfg.get("expiry")
-        if not expiry:
-            return False
-
-        if isinstance(expiry, str):
-            try:
-                expiry = datetime.datetime.fromisoformat(expiry)
-            except:
-                return False
-
-        return expiry > datetime.datetime.utcnow()
-
-    except Exception as e:
-        print("Token check error:", e)
-        return False
-
-
-# -----------------------------------------
-# Strategy Registry
-# -----------------------------------------
-STRATEGIES = {
-    "swing": run_swing_backtest,
-    "momentum": run_momentum_backtest,
-    "fast_swing": run_fast_swing_backtest,
-}
-
-
-# -----------------------------------------
-# API Models
-# -----------------------------------------
-class StrategyRequest(BaseModel):
-    strategy: str = "swing"
-    start_date: str
-    end_date: str
-    symbols_file: str | None = "nifty100.csv"
-
-
-# -----------------------------------------
-# Basic Routes
-# -----------------------------------------
+# ==============================
+# BASIC ROUTES
+# ==============================
 @app.get("/health")
 def health():
-    return {"status":"ok","time":time.time(),"token_valid":is_token_valid()}
+    return {
+        "status": "ok",
+        "time": time.time(),
+        "token_valid": is_token_valid()
+    }
 
 
 @app.get("/")
 def root():
-    return {"message":"StockBot Backend Running"}
+    return {"message": "StockBot Backend Running"}
 
 
-# -----------------------------------------
-# Kite OAuth Routes
-# -----------------------------------------
+# ==============================
+# KITE LOGIN
+# ==============================
 @app.get("/generate_token_url")
 def generate_token_url():
     kite = KiteConnect(api_key=KITE_API_KEY)
@@ -221,45 +181,40 @@ def generate_token_url():
 
 
 @app.get("/kite/callback")
-def kite_callback(request_token: str = None, status: str = None):
+def kite_callback(request_token: str = None):
     try:
-        if not request_token:
-            return JSONResponse({"detail": "Missing request_token"}, 400)
-
         kite = KiteConnect(api_key=KITE_API_KEY)
         sess = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
-
         save_access_token(sess["access_token"])
-
         return RedirectResponse("https://stockbot-dashboard.onrender.com?token_success=1")
-
     except Exception as e:
         print("Callback error:", e)
         return RedirectResponse("https://stockbot-dashboard.onrender.com?token_error=1")
 
 
-# -----------------------------------------
-# Run Strategy (Background)
-# -----------------------------------------
+# ==============================
+# RUN STRATEGY
+# ==============================
 @app.post("/run_strategy")
 def run_strategy(req: StrategyRequest, bg: BackgroundTasks):
+
     if req.strategy not in STRATEGIES:
-        raise HTTPException(400, "Unknown strategy")
+        raise HTTPException(400, f"Unknown strategy {req.strategy}")
 
     if not is_token_valid():
-        raise HTTPException(400, "No valid Kite token. Login again.")
+        raise HTTPException(400, "No valid Kite access token")
 
-    access_token = get_saved_token()
+    access = get_saved_token()
 
-    def runner():
+    def worker():
         try:
             fn = STRATEGIES[req.strategy]
             result = fn(
                 API_KEY=KITE_API_KEY,
-                ACCESS_TOKEN=access_token,
+                ACCESS_TOKEN=access,
                 START_DATE=req.start_date,
                 END_DATE=req.end_date,
-                NIFTY100_FILE=req.symbols_file or "nifty100.csv"
+                NIFTY100_FILE=req.symbols_file
             )
 
             record = {
@@ -272,32 +227,20 @@ def run_strategy(req: StrategyRequest, bg: BackgroundTasks):
 
             mongo_db["backtests"].insert_one(record)
             print("✅ Backtest saved.")
-
         except Exception as e:
-            print("Backtest error:", e)
+            print("❌ Backtest error:", e)
 
-    bg.add_task(runner)
+    bg.add_task(worker)
     return {"status": "started"}
 
 
-# -----------------------------------------
-# GET BACKTESTS — FULLY PATCHED SAFE VERSION
-# -----------------------------------------
+# ==============================
+# FETCH SAVED BACKTESTS
+# ==============================
 @app.get("/backtests")
 def get_backtests():
     try:
-        cursor = mongo_db["backtests"].find({}).sort("timestamp", -1)
-        raw = list(cursor)
-        safe = sanitize(raw)
-
-        return JSONResponse(
-            content={"status":"ok","count":len(safe),"data":safe},
-            status_code=200
-        )
-
+        data = list(mongo_db["backtests"].find({}, {"_id": 0}).sort("timestamp", -1))
+        return {"status": "ok", "count": len(data), "data": data}
     except Exception as e:
-        print("❌ ERROR /backtests:", e)
         return JSONResponse({"detail": str(e)}, 500)
-
-
-
