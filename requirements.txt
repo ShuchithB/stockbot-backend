@@ -1,16 +1,12 @@
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-
-motor==4.1.0
-pymongo==4.4.0
-pandas==2.2.3
-numpy==1.26.4
-python-dotenv==1.0.0
-python-dateutil==2.8.2
-aiohttp==3.8.4
-
-git+https://github.com/zerodhatech/pykiteconnect.git@master
-pydantic==1.10.13
-requests==2.31.0
-
-
+# requirements.txt (recommended)
+fastapi>=0.95.2
+uvicorn[standard]>=0.18.0
+# Install kiteconnect from GitHub to avoid pip wheel problems on some platforms
+kiteconnect @ git+https://github.com/zerodhatech/pykiteconnect.git@master
+motor>=3.2.0        # async Mongo driver (do not pin to a non-existing 4.x if unavailable)
+pymongo>=4.4.0
+pandas>=2.2.3
+numpy>=1.26.4
+python-dotenv>=1.0.0
+python-dateutil>=2.8.2
+aiohttp>=3.8.4
