@@ -267,16 +267,25 @@ def run_strategy(req: StrategyRequest, background_tasks: BackgroundTasks):
     return {"status":"started", "message": f"{req.strategy} backtest started in background"}
 
 # === Fetch saved backtests ===
+from bson.json_util import dumps
+from fastapi.responses import JSONResponse
+
 @app.get("/backtests")
-def list_backtests(limit: int = 50):
+async def get_backtests():
     try:
-        db = get_db()
-        docs = list(db["backtests"].find({}, {"_id":0}).sort("timestamp", -1).limit(limit))
-        # convert datetimes to iso strings
-        for d in docs:
-            if isinstance(d.get("timestamp"), datetime.datetime):
-                d["timestamp"] = d["timestamp"].isoformat()
-        return {"backtests": docs}
+        col = mongo_db["backtests"]
+
+        cursor = col.find({}, {"_id": 0}).sort("timestamp", -1)
+
+        results = list(cursor)
+
+        return JSONResponse(
+            content={"status": "ok", "count": len(results), "data": results},
+            status_code=200
+        )
+
     except Exception as e:
+        print("❌ ERROR in /backtests:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
