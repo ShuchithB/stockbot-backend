@@ -183,7 +183,7 @@ def is_token_valid():
 # -----------------------------------------
 STRATEGIES = {
     "swing": run_swing_backtest,
-    "momentum": run_momentum_backtest
+    "momentum": run_momentum_backtest,
     "fast_swing": run_fast_swing_backtest
 }
 
@@ -298,4 +298,5 @@ def get_backtests():
     except Exception as e:
         print("❌ ERROR /backtests:", e)
         return JSONResponse({"detail": str(e)}, 500)
+
 
